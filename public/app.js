@@ -1,4 +1,3 @@
-// WIKISPRINT client
 const $ = s => document.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const store = {
@@ -11,11 +10,11 @@ if (!token) { token = (crypto.randomUUID?.() || Math.random().toString(36).slice
 let myName = store.get('rh_name') || 'Player ' + Math.floor(1000 + Math.random() * 9000);
 
 let me = null, lobby = null, skew = 0;
-let daily = null;        // latest /api/daily state
-let inDaily = false;     // is the player currently in the daily flow?
-let game = null;         // the round on screen: {mode, key, target, start, studyEndsAt, raceEndsAt, date}
+let daily = null;
+let inDaily = false;
+let game = null;
 let studyKey = null, raceKey = null;
-let hist = [];           // local navigation stack during a race
+let hist = [];
 let navBusy = false;
 const AVATAR_COLORS = ['#ffe866', '#ffb9a6', '#b9d3ff', '#c6ebb2', '#e4c9ff', '#ffd59e', '#a9e4e0', '#f7c1dc'];
 const colorFor = id => AVATAR_COLORS[[...id].reduce((a, c) => a + c.charCodeAt(0), 0) % AVATAR_COLORS.length];
@@ -27,7 +26,6 @@ const avatar = p => `<span class="avatar" style="background:${colorFor(p.id)}">$
 const ordinal = n => n + (['th', 'st', 'nd', 'rd'][(n % 100 - 20) % 10] || ['th', 'st', 'nd', 'rd'][n % 100] || 'th');
 const plural = (n, w) => `${n} ${w}${n === 1 ? '' : 's'}`;
 
-// ---------------- ui helpers ----------------
 function show(name) {
   document.querySelectorAll('.screen').forEach(s => s.classList.toggle('active', s.id === 'scr-' + name));
   window.scrollTo(0, 0);
@@ -64,11 +62,9 @@ $('#brandLink').addEventListener('click', e => {
   goHome();
 });
 
-// ---------------- party mode (HTTP polling) ----------------
-// The host may be serverless, so rooms are kept up to date by asking the server about once a second.
-let room = null;         // code of the room we're in
+let room = null;
 let pollTimer = null;
-let pollSeq = 0;         // ignore poll answers that arrive after a newer action's answer
+let pollSeq = 0;
 
 async function send(o) {
   const { t, ...rest } = o;
@@ -93,11 +89,25 @@ function onPartyState(st) {
   onLobby();
   if (!pollTimer) schedulePoll();
 }
-function schedulePoll() {
+// The database bills per request, so poll only as often as the screen needs:
+// every second while racing, every 3 seconds in the lobby or on results, never from a background tab.
+const POLL_RACE_MS = 1000, POLL_IDLE_MS = 3000;
+const IDLE_LEAVE_MS = 15 * 60_000; // leave the room after 15 minutes with no clicks, keys or scrolling
+let lastActive = Date.now();
+['pointerdown', 'keydown', 'wheel', 'touchstart'].forEach(ev => addEventListener(ev, () => { lastActive = Date.now(); }, { passive: true }));
+
+function schedulePoll(delay) {
   clearTimeout(pollTimer);
-  const fast = lobby && (lobby.phase === 'study' || lobby.phase === 'race' || lobby.phase === 'loading');
+  if (!room || document.hidden) { pollTimer = null; return; } // resumes when the tab is visible again
+  const isRacing = () => lobby && (lobby.phase === 'study' || lobby.phase === 'race' || lobby.phase === 'loading');
   pollTimer = setTimeout(async () => {
-    if (!room) { pollTimer = null; return; }
+    if (!room || document.hidden) { pollTimer = null; return; }
+    if (!isRacing() && Date.now() - lastActive > IDLE_LEAVE_MS) {
+      pollTimer = null;
+      await send({ t: 'leave' });
+      toast('You left the room after 15 minutes of no activity.');
+      return;
+    }
     const seq = ++pollSeq;
     try {
       const st = await api('/api/party/state', { code: room });
@@ -105,9 +115,14 @@ function schedulePoll() {
     } catch (e) {
       if (e.status === 404) { leftRoom(e.message); return; }
     }
-    if (room) schedulePoll(); else pollTimer = null;
-  }, fast ? 800 : 1500);
+    schedulePoll();
+  }, delay ?? (isRacing() ? POLL_RACE_MS : POLL_IDLE_MS));
 }
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) { clearTimeout(pollTimer); pollTimer = null; return; }
+  lastActive = Date.now(); // coming back to the tab counts as activity
+  if (room) schedulePoll(0); // catch up straight away
+});
 function leftRoom(msg) {
   room = null; lobby = null;
   clearTimeout(pollTimer); pollTimer = null;
@@ -119,7 +134,6 @@ async function loadMe() {
   try { store.set('rh_name', myName); me = await api('/api/me', { name: myName }); renderMe(); } catch {}
 }
 
-// ---------------- settings (gear in the top bar) ----------------
 const FONTS = ['default', 'dyslexic'];
 function applyFont(f) {
   if (!FONTS.includes(f)) f = 'default';
@@ -144,7 +158,6 @@ document.addEventListener('keydown', e => {
   if (e.key === 'Escape' && !$('#settings').classList.contains('hidden')) { toggleSettings(false); $('#gearBtn').focus(); }
 });
 
-// ---------------- home: party controls ----------------
 $('#nameInput').value = myName;
 let renameT;
 $('#nameInput').addEventListener('input', e => {
@@ -171,7 +184,6 @@ async function loadLeaderboard() {
   } catch { $('#leaderboard').innerHTML = '<li class="muted">Unavailable.</li>'; }
 }
 
-// ---------------- daily ----------------
 async function api(path, body) {
   const opts = body ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token, name: myName, ...body }) } : undefined;
   const r = await fetch(path, opts);
@@ -191,7 +203,6 @@ function applyDaily(st) {
   if (!inDaily) return;
   const a = st.attempt;
   if (!a) {
-    // the server has no record of the run we're playing: say so instead of hanging
     if (game?.mode === 'daily') { goHome(); toast('The server lost track of your run. Please start again.'); }
     return;
   }
@@ -247,7 +258,6 @@ $('#giveUpBtn').onclick = async () => {
   try { applyDaily(await api('/api/daily/giveup', { date: game.date })); } catch (e) { toast(e.message); }
 };
 
-// ---------------- daily report ----------------
 function renderReport() {
   game = null;
   show('report');
@@ -316,7 +326,6 @@ $('#shareBtn').onclick = async () => {
 };
 $('#reportHomeBtn').onclick = goHome;
 
-// ---------------- party: lobby ----------------
 $('#leaveBtn').onclick = () => send({ t: 'leave' });
 $('#copyBtn').onclick = async () => {
   const link = `${location.origin}/?code=${lobby.code}`;
@@ -364,7 +373,6 @@ function onLobby() {
   else if (ph === 'results') { game = null; renderResults(); }
 }
 
-// ---------------- wikipedia ----------------
 const NS = /^(File|Image|Category|Help|Special|Wikipedia|Template|Template talk|Portal|Talk|User|User talk|Draft|Module|MediaWiki|Book|TimedText|WP|Wikt|Wiktionary|Media):/i;
 const artCache = new Map();
 async function fetchArticle(title) {
@@ -406,7 +414,6 @@ function renderArticle(el, art, sub) {
   el.innerHTML = `<h1 class="art-title">${art.display || esc(art.title)}</h1><div class="art-sub">${esc(sub)}</div>` + doc.body.innerHTML;
 }
 
-// ---------------- shared study / race ----------------
 function setModeUI(mode) {
   document.querySelectorAll('.party-only').forEach(el => el.classList.toggle('mode-hidden', mode !== 'party'));
   document.querySelectorAll('.daily-only').forEach(el => el.classList.toggle('mode-hidden', mode !== 'daily'));
@@ -499,7 +506,6 @@ function renderRacers() {
     || '<li class="muted">You joined mid-race. You\'ll be in the next one.</li>';
 }
 
-// ---------------- party results ----------------
 function renderResults() {
   show('results');
   const r = lobby.round;
@@ -519,7 +525,6 @@ function renderResults() {
   }).join('') || '<li class="muted">Nobody raced.</li>';
 }
 
-// ---------------- clocks ----------------
 let studyRefetching = false;
 setInterval(() => {
   if (!game) return;
@@ -530,7 +535,6 @@ setInterval(() => {
     $('#studyClock').textContent = s;
     $('.countdown').classList.toggle('urgent', s <= 5);
     $('#studyFill').style.width = Math.max(0, Math.min(100, left / 200)) + '%';
-    // the daily has no server push: ask for the start article once study time is up
     if (game.mode === 'daily' && left <= 0 && !studyRefetching) {
       studyRefetching = true;
       api('/api/daily?token=' + encodeURIComponent(token)).then(applyDaily).catch(() => {}).finally(() => { studyRefetching = false; });

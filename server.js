@@ -20,18 +20,28 @@ const REDIS_TOKEN = process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_R
 let pipeline;
 if (REDIS_URL && REDIS_TOKEN) {
   pipeline = async cmds => {
-    const r = await fetch(REDIS_URL.replace(/\/$/, '') + '/pipeline', {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${REDIS_TOKEN}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify(cmds.map(c => c.map(String))),
-    });
-    if (!r.ok) throw new Error('Redis HTTP ' + r.status);
+    let r;
+    try {
+      r = await fetch(REDIS_URL.replace(/\/$/, '') + '/pipeline', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${REDIS_TOKEN}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify(cmds.map(c => c.map(String))),
+      });
+    } catch (e) { throw new Error('Redis unreachable: ' + (e.cause?.code || e.message)); }
+    if (!r.ok) {
+      // Upstash puts the reason (e.g. a usage limit) in the body
+      const why = await r.text().catch(() => '');
+      throw new Error(`Redis HTTP ${r.status}${why ? ': ' + why.slice(0, 200) : ''}`);
+    }
     return (await r.json()).map(x => { if (x.error) throw new Error('Redis: ' + x.error); return x.result; });
   };
 } else {
   pipeline = localStore();
   console.log('No Redis configured, using data/local-store.json');
 }
+// count commands (Upstash bills per command) so /api/health can show how busy this instance has been
+let commandCount = 0;
+{ const run = pipeline; pipeline = cmds => { commandCount += cmds.length; return run(cmds); }; }
 const redis = async (...cmd) => (await pipeline([cmd]))[0];
 
 // Minimal stand-in for the handful of Redis commands used here.
@@ -52,6 +62,7 @@ function localStore() {
   const run = ([cmd, k, ...a]) => {
     const e = live(k);
     switch (cmd.toUpperCase()) {
+      case 'PING': return 'PONG';
       case 'GET': return e ? e.v : null;
       case 'SET': {
         if (a.includes('NX') && e) return null;
@@ -306,12 +317,21 @@ async function handleDaily(route, b, token) {
 }
 
 // ================= PARTY ROOMS =================
-// Clients poll /api/party/state about once a second. Phases are worked out from timestamps,
-// so no server-side timers are needed. Each player only ever writes their own hash field,
-// and only the host writes the room record, so concurrent requests don't overwrite each other.
+// Clients poll /api/party/state (every second in a race, every few seconds otherwise, never from
+// a background tab). Phases are worked out from timestamps, so no server-side timers are needed.
+// Each player only ever writes their own hash field and only the host writes the room record,
+// so concurrent requests don't overwrite each other.
+//
+// Upstash bills per command, so a poll is kept to one 6-command pipeline:
+//   r:CODE        room record (JSON)          r:CODE:paths  current round's paths, per player
+//   r:CODE:pl     players: {name, joinedAt, elo}   r:CODE:win    winner of the current round
+//   r:CODE:seen   last time each player polled     r:CODE:delta  Elo changes of the current round
+// Elo is copied into the player list on join and refreshed when a race ends, instead of being
+// looked up for every player on every poll.
 const rk = code => 'r:' + code;
-const ONLINE_MS = 8000;    // no poll for this long = shown as away
-const DROP_MS = 120_000;   // no poll for this long = removed from the room
+const ONLINE_MS = 12_000;  // not seen for this long = shown as away
+const SEEN_EVERY_MS = 5000; // only record "still here" this often
+const DROP_MS = 120_000;   // not seen for this long = removed (they're re-added if they come back)
 
 function newCode() {
   const A = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
@@ -324,48 +344,50 @@ function phaseOf(meta, winner, now) {
   if (winner || meta.ended || now >= r.raceEndsAt) return 'results';
   return now < r.studyEndsAt ? 'study' : 'race';
 }
+const roomKeys = code => ['', ':pl', ':seen', ':paths', ':win', ':delta'].map(s => rk(code) + s);
 
-// Loads everything about a room in two round trips and marks the caller as seen.
+// Loads everything about a room in one round trip. If `token` is given, records that they're here
+// (at most every few seconds).
 async function loadRoom(code, token) {
   const now = Date.now();
-  const cmds = [['GET', rk(code)], ['HGETALL', rk(code) + ':pl'], ['HGETALL', rk(code) + ':seen']];
-  if (token) cmds.unshift(['HSET', rk(code) + ':seen', token, now]);
-  const res = await pipeline(cmds);
-  if (token) res.shift();
-  const meta = J(res[0]);
+  const k = rk(code);
+  const [metaRaw, plRaw, seenRaw, pathsRaw, winner, deltaRaw] = await pipeline([
+    ['GET', k], ['HGETALL', k + ':pl'], ['HGETALL', k + ':seen'], ['HGETALL', k + ':paths'], ['GET', k + ':win'], ['GET', k + ':delta'],
+  ]);
+  const meta = J(metaRaw);
   if (!meta) throw new HttpError(404, 'That room no longer exists.');
-  const pl = {}; for (const [t, v] of Object.entries(hobj(res[1]))) pl[t] = J(v) || {};
-  const seen = {}; for (const [t, v] of Object.entries(hobj(res[2]))) seen[t] = +v;
+  const pl = {}; for (const [t, v] of Object.entries(hobj(plRaw))) pl[t] = J(v) || {};
+  const seen = {}; for (const [t, v] of Object.entries(hobj(seenRaw))) seen[t] = +v;
+  const paths = {}; for (const [t, v] of Object.entries(hobj(pathsRaw))) paths[t] = J(v) || [];
 
-  // forget players who haven't polled in a while
+  const writes = [];
+  if (token && pl[token] && now - (seen[token] || 0) > SEEN_EVERY_MS) {
+    writes.push(['HSET', k + ':seen', token, now]);
+    seen[token] = now;
+  }
+  // forget players who haven't been seen in a while
   const gone = Object.keys(pl).filter(t => t !== token && now - (seen[t] || pl[t].joinedAt || 0) > DROP_MS);
   if (gone.length) {
-    await pipeline([['HDEL', rk(code) + ':pl', ...gone], ['HDEL', rk(code) + ':seen', ...gone]]);
+    writes.push(['HDEL', k + ':pl', ...gone], ['HDEL', k + ':seen', ...gone]);
     gone.forEach(t => delete pl[t]);
   }
-
-  const n = meta.n || 0;
-  const tokens = Object.keys(pl);
-  const more = [['HGETALL', `${rk(code)}:paths:${n}`], ['GET', `${rk(code)}:win:${n}`], ['GET', `${rk(code)}:delta:${n}`]];
-  const [pathsRaw, winner, deltaRaw] = await pipeline(more);
-  const paths = {}; for (const [t, v] of Object.entries(hobj(pathsRaw))) paths[t] = J(v) || [];
-  const profiles = await getProfiles(tokens);
+  if (writes.length) await pipeline(writes);
 
   const online = t => now - (seen[t] || 0) < ONLINE_MS;
   // if the host has gone quiet, the longest-standing player who is still here takes over
-  const byJoin = tokens.slice().sort((a, b) => (pl[a].joinedAt || 0) - (pl[b].joinedAt || 0));
+  const byJoin = Object.keys(pl).sort((a, b) => (pl[a].joinedAt || 0) - (pl[b].joinedAt || 0));
   const hostId = pl[meta.host] && online(meta.host) ? meta.host : (byJoin.find(online) || meta.host);
-  return { meta, pl, seen, paths, winner, deltas: J(deltaRaw) || {}, profiles, now, online, hostId, phase: phaseOf(meta, winner, now) };
+  return { meta, pl, seen, paths, winner, deltas: J(deltaRaw) || {}, now, online, hostId, phase: phaseOf(meta, winner, now) };
 }
 
 function snapshot(R) {
-  const { meta, pl, paths, winner, deltas, profiles, now, online, hostId, phase } = R;
+  const { meta, pl, paths, winner, deltas, now, online, hostId, phase } = R;
   const r = meta.round;
   const inRound = meta.phase === 'round' && r;
   const players = Object.keys(pl).sort((a, b) => (pl[a].joinedAt || 0) - (pl[b].joinedAt || 0)).map(id => {
     const prog = inRound && r.participants.includes(id) ? (paths[id] || [r.start]) : null;
     return {
-      id, name: profiles[id]?.name || pl[id].name || 'Player', elo: profiles[id]?.elo ?? START_ELO,
+      id, name: pl[id].name || 'Player', elo: pl[id].elo ?? START_ELO,
       connected: online(id), host: id === hostId,
       clicks: prog ? prog.length - 1 : 0, inRace: !!prog,
       path: phase === 'results' && prog ? prog : undefined,
@@ -388,10 +410,12 @@ const saveMeta = (code, meta) => pipeline([
   ['SET', rk(code), JSON.stringify(meta), 'EX', ROOM_TTL],
   ['EXPIRE', rk(code) + ':pl', ROOM_TTL], ['EXPIRE', rk(code) + ':seen', ROOM_TTL],
 ]);
+const playerEntry = (prof, joinedAt = Date.now()) => JSON.stringify({ name: prof.name, joinedAt, elo: prof.elo });
 
-async function applyElo(code, n, participants, winnerId) {
+async function applyElo(code, participants, winnerId, pl) {
   const profiles = await getProfiles(participants);
   const deltas = {};
+  const cmds = [];
   if (participants.length > 1) {
     // Winner beats every other racer. Pair K shrinks as the field grows.
     const K = 40 / Math.sqrt(participants.length - 1);
@@ -405,15 +429,16 @@ async function applyElo(code, n, participants, winnerId) {
       deltas[id] = -Math.round(d);
     }
     deltas[winnerId] = Math.round(gain);
-    const cmds = [];
     for (const id of participants) {
-      cmds.push(['HINCRBY', pkey(id), 'elo', deltas[id]], ['HINCRBY', pkey(id), 'games', 1]);
-      cmds.push(['ZADD', 'lb', profiles[id].elo + deltas[id], id]);
+      const elo = profiles[id].elo + deltas[id];
+      cmds.push(['HINCRBY', pkey(id), 'elo', deltas[id]], ['HINCRBY', pkey(id), 'games', 1], ['ZADD', 'lb', elo, id]);
+      // refresh the copy of their Elo kept in the room
+      if (pl[id]) cmds.push(['HSET', rk(code) + ':pl', id, JSON.stringify({ ...pl[id], name: profiles[id].name, elo })]);
     }
     cmds.push(['HINCRBY', pkey(winnerId), 'wins', 1]);
-    await pipeline(cmds);
   }
-  await redis('SET', `${rk(code)}:delta:${n}`, JSON.stringify(deltas), 'EX', ROOM_TTL);
+  cmds.push(['SET', rk(code) + ':delta', JSON.stringify(deltas), 'EX', ROOM_TTL]);
+  await pipeline(cmds);
 }
 
 async function handleParty(action, b, token) {
@@ -427,8 +452,8 @@ async function handleParty(action, b, token) {
       const meta = { code: c, host: token, phase: 'lobby', settings: { raceMinutes: 10 }, n: 0 };
       if (await redis('SET', rk(c), JSON.stringify(meta), 'NX', 'EX', ROOM_TTL)) {
         await pipeline([
-          ['HSET', rk(c) + ':pl', token, JSON.stringify({ name: prof.name, joinedAt: Date.now() })],
-          ['EXPIRE', rk(c) + ':pl', ROOM_TTL],
+          ['HSET', rk(c) + ':pl', token, playerEntry(prof)], ['EXPIRE', rk(c) + ':pl', ROOM_TTL],
+          ['HSET', rk(c) + ':seen', token, Date.now()], ['EXPIRE', rk(c) + ':seen', ROOM_TTL],
         ]);
         return { lobby: snapshot(await loadRoom(c, token)) };
       }
@@ -437,33 +462,36 @@ async function handleParty(action, b, token) {
   }
   if (!code) throw new HttpError(400, 'Missing room code.');
 
+  const addPlayer = async () => {
+    const prof = await touchProfile(token, cleanName(b.name));
+    await pipeline([['HSETNX', rk(code) + ':pl', token, playerEntry(prof)], ['HSET', rk(code) + ':seen', token, Date.now()]]);
+  };
   if (action === 'join') {
     if (!(await redis('GET', rk(code)))) throw new HttpError(404, 'No room with that code.');
-    const prof = await touchProfile(token, cleanName(b.name));
-    await redis('HSETNX', rk(code) + ':pl', token, JSON.stringify({ name: prof.name, joinedAt: Date.now() }));
+    await addPlayer();
     return { lobby: snapshot(await loadRoom(code, token)) };
   }
   if (action === 'leave') {
-    await pipeline([['HDEL', rk(code) + ':pl', token], ['HDEL', rk(code) + ':seen', token]]);
-    const left = hobj(await redis('HGETALL', rk(code) + ':pl'));
-    if (!Object.keys(left).length) await redis('DEL', rk(code), rk(code) + ':pl', rk(code) + ':seen');
+    const [, , left] = await pipeline([['HDEL', rk(code) + ':pl', token], ['HDEL', rk(code) + ':seen', token], ['HGETALL', rk(code) + ':pl']]);
+    if (!left || !left.length) await redis('DEL', ...roomKeys(code));
     return { left: true };
   }
 
   let R = await loadRoom(code, token);
   if (!R.pl[token] && action === 'state') {
     // dropped for being away too long (closed laptop, lost signal): let them back in
-    const prof = await touchProfile(token);
-    await redis('HSETNX', rk(code) + ':pl', token, JSON.stringify({ name: prof.name, joinedAt: Date.now() }));
+    await addPlayer();
     R = await loadRoom(code, token);
   }
   if (!R.pl[token]) throw new HttpError(404, 'You are not in this room.');
+  // the common case: nothing to change, so answer from what was just loaded
+  if (action === 'state') return { lobby: snapshot(R) };
+
   const { meta, phase } = R;
   const isHost = R.hostId === token;
   if (isHost && meta.host !== token) meta.host = token; // persist a host hand-over on the next write
 
   switch (action) {
-    case 'state': break;
     case 'settings':
       if (isHost && phase === 'lobby' && [3, 5, 10, 15].includes(b.raceMinutes)) {
         meta.settings.raceMinutes = b.raceMinutes; await saveMeta(code, meta);
@@ -481,11 +509,13 @@ async function handleParty(action, b, token) {
       meta.n = (meta.n || 0) + 1;
       meta.phase = 'round'; meta.ended = false; meta.error = null;
       meta.round = { ...picks, participants, studyEndsAt: now + STUDY_MS, raceEndsAt: now + STUDY_MS + meta.settings.raceMinutes * 60_000 };
+      // clear the previous round before writing the new one
       await pipeline([
-        ['HSET', `${rk(code)}:paths:${meta.n}`, ...participants.flatMap(t => [t, JSON.stringify([picks.start])])],
-        ['EXPIRE', `${rk(code)}:paths:${meta.n}`, ROOM_TTL],
+        ['DEL', rk(code) + ':paths', rk(code) + ':win', rk(code) + ':delta'],
+        ['HSET', rk(code) + ':paths', ...participants.flatMap(t => [t, JSON.stringify([picks.start])])],
+        ['EXPIRE', rk(code) + ':paths', ROOM_TTL],
+        ['SET', rk(code), JSON.stringify(meta), 'EX', ROOM_TTL],
       ]);
-      await saveMeta(code, meta);
       break;
     }
     case 'toLobby':
@@ -497,16 +527,15 @@ async function handleParty(action, b, token) {
     case 'nav': {
       const r = meta.round;
       if (phase !== 'race' || !r.participants.includes(token)) break;
-      const key = `${rk(code)}:paths:${meta.n}`;
-      const p = J(await redis('HGET', key, token)) || [r.start];
+      const p = R.paths[token] && R.paths[token].length ? R.paths[token].slice() : [r.start];
       const title = norm(b.title).slice(0, 300);
       if (!title || p[p.length - 1] === title) break;
       p.push(title);
-      await redis('HSET', key, token, JSON.stringify(p));
+      await redis('HSET', rk(code) + ':paths', token, JSON.stringify(p));
       if (title === norm(r.target)) {
         // SET NX: if two players arrive at the same moment, only one becomes the winner
-        if (await redis('SET', `${rk(code)}:win:${meta.n}`, token, 'NX', 'EX', ROOM_TTL)) {
-          await applyElo(code, meta.n, r.participants, token);
+        if (await redis('SET', rk(code) + ':win', token, 'NX', 'EX', ROOM_TTL)) {
+          await applyElo(code, r.participants, token, R.pl);
         }
       }
       break;
@@ -530,6 +559,13 @@ async function handleApi(req, res, url) {
     if (!token) throw new HttpError(400, 'Missing player token.');
     return json(res, 200, { id: token, ...(await touchProfile(token, req.method === 'POST' ? cleanName(b.name) : undefined)) });
   }
+  if (route === '/api/health') {
+    // Reports whether the database is reachable, and its error if not. Never includes the URL or token.
+    const out = { storage: REDIS_URL && REDIS_TOKEN ? 'upstash' : 'local-file', ok: false };
+    try { out.ok = (await redis('PING')) === 'PONG'; } catch (e) { out.error = String(e.message).slice(0, 300); }
+    out.commandsSinceStart = commandCount;
+    return json(res, out.ok ? 200 : 503, out);
+  }
   if (route === '/api/leaderboard') {
     const flat = await redis('ZREVRANGE', 'lb', 0, 14, 'WITHSCORES');
     const ids = flat.filter((_, i) => i % 2 === 0);
@@ -545,8 +581,11 @@ async function handler(req, res) {
   if (url.pathname.startsWith('/api/')) {
     try { await handleApi(req, res, url); }
     catch (e) {
-      if (!(e instanceof HttpError)) console.error(e);
-      json(res, e.status || 500, { error: e instanceof HttpError ? e.message : 'Something went wrong. Try again.' });
+      if (e instanceof HttpError) return json(res, e.status, { error: e.message });
+      console.error(e);
+      // database trouble gets its own status so it's easy to tell apart from a bug
+      if (/^Redis/.test(e.message)) return json(res, 503, { error: 'The game database is not responding right now. Please try again in a bit.' });
+      json(res, 500, { error: 'Something went wrong. Try again.' });
     }
     return;
   }
